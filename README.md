@@ -177,6 +177,22 @@ compressed; the cost of decompression is borne with each Read.
 diskv also now provides ReadStream and WriteStream methods, to allow very large
 data to be handled efficiently.
 
+## Migrating a store
+
+`Migrate` moves an existing store to a new base path without stopping reads or
+writes. Writes go to the new base path immediately. Reads look in the new base
+path first and fall back to the old one until all files have moved. After a
+successful migration, the old base path is removed.
+
+```go
+if err := d.Migrate("my-new-data-dir"); err != nil {
+	log.Fatal(err)
+}
+```
+
+The call is synchronous; run it in a goroutine if the caller should continue
+doing other work while the migration proceeds.
+
 
 # Future plans
 

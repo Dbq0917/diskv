@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	defaultBasePath             = "diskv"
-	defaultFilePerm os.FileMode = 0666
-	defaultPathPerm os.FileMode = 0777
+	defaultBasePath                 = "diskv"
+	defaultFilePerm     os.FileMode = 0666
+	defaultPathPerm     os.FileMode = 0777
+	migrationTempPrefix             = ".diskv-migrate-"
 )
 
 // PathKey represents a string key that has been transformed to
@@ -36,6 +37,7 @@ var (
 	defaultInverseTransform  = func(pathKey *PathKey) string { return pathKey.FileName }
 	errCanceled              = errors.New("canceled")
 	errEmptyKey              = errors.New("empty key")
+	errEmptyBasePath         = errors.New("empty base path")
 	errBadKey                = errors.New("bad key")
 	errImportDirectory       = errors.New("can't import a directory")
 )
@@ -93,9 +95,15 @@ type Options struct {
 // structures directly; instead, use the New constructor.
 type Diskv struct {
 	Options
-	mu        sync.RWMutex
-	cache     map[string][]byte
-	cacheSize uint64
+	mu          sync.RWMutex
+	migrationMu sync.Mutex
+	cache       map[string][]byte
+	cacheSize   uint64
+
+	legacyBasePaths []string
+	generations     map[string]uint64
+	migrating       bool
+	migrationHook   func()
 }
 
 // New returns an initialized Diskv structure, ready to use.
@@ -129,9 +137,10 @@ func New(o Options) *Diskv {
 	}
 
 	d := &Diskv{
-		Options:   o,
-		cache:     map[string][]byte{},
-		cacheSize: 0,
+		Options:     o,
+		cache:       map[string][]byte{},
+		cacheSize:   0,
+		generations: map[string]uint64{},
 	}
 
 	if d.Index != nil && d.IndexLess != nil {
@@ -226,6 +235,8 @@ func (d *Diskv) createKeyFileWithLock(pathKey *PathKey) (*os.File, error) {
 
 // writeStream does no input validation checking.
 func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) error {
+	d.bumpGenerationWithLock(pathKey.originalKey)
+
 	if err := d.ensurePathWithLock(pathKey); err != nil {
 		return fmt.Errorf("ensure path: %s", err)
 	}
@@ -286,6 +297,275 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 	return nil
 }
 
+// Migrate moves the store's data to newBasePath while reads and writes remain
+// available. Writes are directed to newBasePath immediately. Reads check the
+// new location first and fall back to the old location until every file has
+// been moved. Once migration completes, the old data is removed.
+//
+// Migrate is safe to call concurrently with Read, ReadStream, Write,
+// WriteStream, Has, Erase, Keys, and KeysPrefix.
+func (d *Diskv) Migrate(newBasePath string) error {
+	if newBasePath == "" {
+		return errEmptyBasePath
+	}
+
+	d.migrationMu.Lock()
+	defer d.migrationMu.Unlock()
+
+	oldBasePaths, err := d.beginMigration(newBasePath)
+	if err != nil {
+		return err
+	}
+	if len(oldBasePaths) == 0 {
+		return nil
+	}
+
+	if d.migrationHook != nil {
+		d.migrationHook()
+	}
+
+	for _, oldBasePath := range oldBasePaths {
+		if err := d.moveBasePath(oldBasePath, newBasePath); err != nil {
+			d.mu.Lock()
+			d.migrating = false
+			d.mu.Unlock()
+			return err
+		}
+	}
+
+	for _, oldBasePath := range oldBasePaths {
+		if err := os.RemoveAll(oldBasePath); err != nil {
+			d.mu.Lock()
+			d.migrating = false
+			d.mu.Unlock()
+			return err
+		}
+	}
+
+	d.mu.Lock()
+	d.legacyBasePaths = nil
+	d.migrating = false
+	d.mu.Unlock()
+
+	return nil
+}
+
+func (d *Diskv) beginMigration(newBasePath string) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	currentBasePath := d.BasePath
+	sameBasePath, err := samePath(currentBasePath, newBasePath)
+	if err != nil {
+		return nil, err
+	}
+
+	oldBasePaths := append([]string(nil), d.legacyBasePaths...)
+	if !sameBasePath {
+		oldBasePaths = append([]string{currentBasePath}, oldBasePaths...)
+	}
+	oldBasePaths = uniquePaths(oldBasePaths, newBasePath)
+
+	for _, oldBasePath := range oldBasePaths {
+		if same, err := samePath(oldBasePath, newBasePath); err != nil {
+			return nil, err
+		} else if same {
+			continue
+		}
+
+		nested, err := pathContains(oldBasePath, newBasePath)
+		if err != nil {
+			return nil, err
+		}
+		if nested {
+			return nil, fmt.Errorf("base paths overlap: %s contains %s", oldBasePath, newBasePath)
+		}
+		nested, err = pathContains(newBasePath, oldBasePath)
+		if err != nil {
+			return nil, err
+		}
+		if nested {
+			return nil, fmt.Errorf("base paths overlap: %s contains %s", newBasePath, oldBasePath)
+		}
+	}
+
+	if sameBasePath && len(oldBasePaths) == 0 {
+		return nil, nil
+	}
+
+	if !sameBasePath {
+		d.BasePath = newBasePath
+	}
+	d.legacyBasePaths = oldBasePaths
+	d.migrating = true
+
+	return oldBasePaths, nil
+}
+
+func (d *Diskv) moveBasePath(oldBasePath, newBasePath string) error {
+	fi, err := os.Stat(oldBasePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("migrate base path: %s is not a directory", oldBasePath)
+	}
+
+	var relativePaths []string
+	err = filepath.Walk(oldBasePath, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		relativePath, err := filepath.Rel(oldBasePath, path)
+		if err != nil {
+			return err
+		}
+		relativePaths = append(relativePaths, relativePath)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, relativePath := range relativePaths {
+		src := filepath.Join(oldBasePath, relativePath)
+		dst := filepath.Join(newBasePath, relativePath)
+		if err := d.moveFile(src, dst); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *Diskv) moveFile(src, dst string) error {
+	d.mu.Lock()
+	if fi, err := os.Stat(dst); err == nil {
+		if fi.IsDir() {
+			d.mu.Unlock()
+			return fmt.Errorf("migrate file: destination %s is a directory", dst)
+		}
+		if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
+			d.mu.Unlock()
+			return err
+		}
+		d.mu.Unlock()
+		return nil
+	} else if !os.IsNotExist(err) {
+		d.mu.Unlock()
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), d.PathPerm); err != nil {
+		d.mu.Unlock()
+		return err
+	}
+	err := os.Rename(src, dst)
+	d.mu.Unlock()
+
+	if err == nil {
+		return nil
+	}
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+
+	return d.copyMigrateFile(src, dst)
+}
+
+func (d *Diskv) copyMigrateFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	dstDir := filepath.Dir(dst)
+	if err := os.MkdirAll(dstDir, d.PathPerm); err != nil {
+		return err
+	}
+
+	tmp, err := ioutil.TempFile(dstDir, migrationTempPrefix)
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			os.Remove(tmpName) // error deliberately ignored
+		}
+	}()
+
+	if err := os.Chmod(tmpName, srcInfo.Mode()); err != nil {
+		tmp.Close() // error deliberately ignored
+		return err
+	}
+	if _, err := io.Copy(tmp, srcFile); err != nil {
+		tmp.Close() // error deliberately ignored
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close() // error deliberately ignored
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	if fi, err := os.Stat(dst); err == nil {
+		if fi.IsDir() {
+			return fmt.Errorf("migrate file: destination %s is a directory", dst)
+		}
+		if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.Rename(tmpName, dst); err != nil {
+		return err
+	}
+	removeTemp = false
+	if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	return nil
+}
+
 // Import imports the source file into diskv under the destination key. If the
 // destination key already exists, it's overwritten. If move is true, the
 // source file is removed after a successful import.
@@ -305,12 +585,17 @@ func (d *Diskv) Import(srcFilename, dstKey string, move bool) (err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	d.bumpGenerationWithLock(dstKey)
+
 	if err := d.ensurePathWithLock(dstPathKey); err != nil {
 		return fmt.Errorf("ensure path: %s", err)
 	}
 
 	if move {
 		if err := syscall.Rename(srcFilename, d.completeFilename(dstPathKey)); err == nil {
+			if d.Index != nil {
+				d.Index.Insert(dstKey)
+			}
 			d.bustCacheWithLock(dstPathKey.originalKey)
 			return nil
 		} else if err != syscall.EXDEV {
@@ -391,37 +676,54 @@ func (d *Diskv) ReadStream(key string, direct bool) (io.ReadCloser, error) {
 // acquire a read lock on the Diskv and check the cache themselves before
 // calling read.
 func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
-	filename := d.completeFilename(pathKey)
+	var lastErr error
+	for _, basePath := range d.basePathsWithLock() {
+		filename := d.completeFilenameForBase(basePath, pathKey)
 
-	fi, err := os.Stat(filename)
-	if err != nil {
-		return nil, err
-	}
-	if fi.IsDir() {
-		return nil, os.ErrNotExist
-	}
-
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	var r io.Reader
-	if d.CacheSizeMax > 0 {
-		r = newSiphon(f, d, pathKey.originalKey)
-	} else {
-		r = &closingReader{f}
-	}
-
-	var rc = io.ReadCloser(ioutil.NopCloser(r))
-	if d.Compression != nil {
-		rc, err = d.Compression.Reader(r)
+		fi, err := os.Stat(filename)
+		if os.IsNotExist(err) {
+			lastErr = err
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
+		if fi.IsDir() {
+			lastErr = os.ErrNotExist
+			continue
+		}
+
+		f, err := os.Open(filename)
+		if os.IsNotExist(err) {
+			lastErr = err
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		var r io.Reader
+		if d.CacheSizeMax > 0 {
+			r = newSiphonWithGeneration(f, d, pathKey.originalKey, d.generationWithRLock(pathKey.originalKey))
+		} else {
+			r = &closingReader{f}
+		}
+
+		var rc = io.ReadCloser(ioutil.NopCloser(r))
+		if d.Compression != nil {
+			rc, err = d.Compression.Reader(r)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return rc, nil
 	}
 
-	return rc, nil
+	if lastErr == nil {
+		lastErr = os.ErrNotExist
+	}
+	return nil, lastErr
 }
 
 // closingReader provides a Reader that automatically closes the
@@ -443,21 +745,27 @@ func (cr closingReader) Read(p []byte) (int, error) {
 // siphon is like a TeeReader: it copies all data read through it to an
 // internal buffer, and moves that buffer to the cache at EOF.
 type siphon struct {
-	f   *os.File
-	d   *Diskv
-	key string
-	buf *bytes.Buffer
+	f          *os.File
+	d          *Diskv
+	key        string
+	generation uint64
+	buf        *bytes.Buffer
 }
 
 // newSiphon constructs a siphoning reader that represents the passed file.
 // When a successful series of reads ends in an EOF, the siphon will write
 // the buffered data to Diskv's cache under the given key.
 func newSiphon(f *os.File, d *Diskv, key string) io.Reader {
+	return newSiphonWithGeneration(f, d, key, d.generationWithRLock(key))
+}
+
+func newSiphonWithGeneration(f *os.File, d *Diskv, key string, generation uint64) io.Reader {
 	return &siphon{
-		f:   f,
-		d:   d,
-		key: key,
-		buf: &bytes.Buffer{},
+		f:          f,
+		d:          d,
+		key:        key,
+		generation: generation,
+		buf:        &bytes.Buffer{},
 	}
 }
 
@@ -470,7 +778,7 @@ func (s *siphon) Read(p []byte) (int, error) {
 	}
 
 	if err == io.EOF {
-		s.d.cacheWithoutLock(s.key, s.buf.Bytes()) // cache may fail
+		s.d.cacheWithoutLock(s.key, s.generation, s.buf.Bytes()) // cache may fail
 		if closeErr := s.f.Close(); closeErr != nil {
 			return n, closeErr // close must succeed for Read to succeed
 		}
@@ -487,24 +795,31 @@ func (d *Diskv) Erase(key string) error {
 	defer d.mu.Unlock()
 
 	d.bustCacheWithLock(key)
+	d.bumpGenerationWithLock(key)
 
 	// erase from index
 	if d.Index != nil {
 		d.Index.Delete(key)
 	}
 
-	// erase from disk
-	filename := d.completeFilename(pathKey)
-	if s, err := os.Stat(filename); err == nil {
-		if s.IsDir() {
-			return errBadKey
-		}
-		if err = os.Remove(filename); err != nil {
+	// erase from every path that can serve this key
+	found := false
+	for _, basePath := range d.basePathsWithLock() {
+		filename := d.completeFilenameForBase(basePath, pathKey)
+		if s, err := os.Stat(filename); err == nil {
+			if s.IsDir() {
+				return errBadKey
+			}
+			if err = os.Remove(filename); err != nil {
+				return err
+			}
+			found = true
+		} else if !os.IsNotExist(err) {
 			return err
 		}
-	} else {
-		// Return err as-is so caller can do os.IsNotExist(err).
-		return err
+	}
+	if !found {
+		return os.ErrNotExist
 	}
 
 	// clean up and return
@@ -517,14 +832,29 @@ func (d *Diskv) Erase(key string) error {
 // diskv-related data. Care should be taken to always specify a diskv base
 // directory that is exclusively for diskv data.
 func (d *Diskv) EraseAll() error {
+	d.migrationMu.Lock()
+	defer d.migrationMu.Unlock()
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.cache = make(map[string][]byte)
 	d.cacheSize = 0
+	d.generations = make(map[string]uint64)
 	if d.TempDir != "" {
 		os.RemoveAll(d.TempDir) // errors ignored
 	}
-	return os.RemoveAll(d.BasePath)
+
+	basePaths := d.basePathsWithLock()
+	d.legacyBasePaths = nil
+	d.migrating = false
+
+	var firstErr error
+	for _, basePath := range basePaths {
+		if err := os.RemoveAll(basePath); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Has returns true if the given key exists.
@@ -537,16 +867,18 @@ func (d *Diskv) Has(key string) bool {
 		return true
 	}
 
-	filename := d.completeFilename(pathKey)
-	s, err := os.Stat(filename)
-	if err != nil {
-		return false
-	}
-	if s.IsDir() {
-		return false
+	for _, basePath := range d.basePathsWithLock() {
+		filename := d.completeFilenameForBase(basePath, pathKey)
+		s, err := os.Stat(filename)
+		if err != nil {
+			continue
+		}
+		if !s.IsDir() {
+			return true
+		}
 	}
 
-	return true
+	return false
 }
 
 // Keys returns a channel that will yield every key accessible by the store,
@@ -561,17 +893,29 @@ func (d *Diskv) Keys(cancel <-chan struct{}) <-chan string {
 // provided, closing it will terminate and close the keys channel. If the
 // provided prefix is the empty string, all keys will be yielded.
 func (d *Diskv) KeysPrefix(prefix string, cancel <-chan struct{}) <-chan string {
-	var prepath string
-	if prefix == "" {
-		prepath = d.BasePath
-	} else {
-		prefixKey := d.transform(prefix)
-		prepath = d.pathFor(prefixKey)
+	var prefixKey *PathKey
+	if prefix != "" {
+		prefixKey = d.transform(prefix)
 	}
+	basePaths := d.basePaths()
 	c := make(chan string)
 	go func() {
-		filepath.Walk(prepath, d.walker(c, prefix, cancel))
-		close(c)
+		defer close(c)
+
+		seen := map[string]struct{}{}
+		for _, basePath := range basePaths {
+			prepath := basePath
+			if prefix != "" {
+				prepath = filepath.Join(basePath, filepath.Join(prefixKey.Path...))
+			}
+			filepath.Walk(prepath, d.walkerForBase(c, prefix, cancel, basePath, seen))
+
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+		}
 	}()
 	return c
 }
@@ -579,12 +923,16 @@ func (d *Diskv) KeysPrefix(prefix string, cancel <-chan struct{}) <-chan string 
 // walker returns a function which satisfies the filepath.WalkFunc interface.
 // It sends every non-directory file entry down the channel c.
 func (d *Diskv) walker(c chan<- string, prefix string, cancel <-chan struct{}) filepath.WalkFunc {
+	return d.walkerForBase(c, prefix, cancel, d.BasePath, nil)
+}
+
+func (d *Diskv) walkerForBase(c chan<- string, prefix string, cancel <-chan struct{}, basePath string, seen map[string]struct{}) filepath.WalkFunc {
 	return func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		relPath, _ := filepath.Rel(d.BasePath, path)
+		relPath, _ := filepath.Rel(basePath, path)
 		dir, file := filepath.Split(relPath)
 		pathSplit := strings.Split(dir, string(filepath.Separator))
 		pathSplit = pathSplit[:len(pathSplit)-1]
@@ -598,6 +946,15 @@ func (d *Diskv) walker(c chan<- string, prefix string, cancel <-chan struct{}) f
 
 		if info.IsDir() || !strings.HasPrefix(key, prefix) {
 			return nil // "pass"
+		}
+		if strings.HasPrefix(file, migrationTempPrefix) {
+			return nil
+		}
+		if seen != nil {
+			if _, ok := seen[key]; ok {
+				return nil
+			}
+			seen[key] = struct{}{}
 		}
 
 		select {
@@ -613,7 +970,11 @@ func (d *Diskv) walker(c chan<- string, prefix string, cancel <-chan struct{}) f
 // pathFor returns the absolute path for location on the filesystem where the
 // data for the given key will be stored.
 func (d *Diskv) pathFor(pathKey *PathKey) string {
-	return filepath.Join(d.BasePath, filepath.Join(pathKey.Path...))
+	return d.pathForBase(d.BasePath, pathKey)
+}
+
+func (d *Diskv) pathForBase(basePath string, pathKey *PathKey) string {
+	return filepath.Join(basePath, filepath.Join(pathKey.Path...))
 }
 
 // ensurePathWithLock is a helper function that generates all necessary
@@ -625,6 +986,72 @@ func (d *Diskv) ensurePathWithLock(pathKey *PathKey) error {
 // completeFilename returns the absolute path to the file for the given key.
 func (d *Diskv) completeFilename(pathKey *PathKey) string {
 	return filepath.Join(d.pathFor(pathKey), pathKey.FileName)
+}
+
+func (d *Diskv) completeFilenameForBase(basePath string, pathKey *PathKey) string {
+	return filepath.Join(d.pathForBase(basePath, pathKey), pathKey.FileName)
+}
+
+func (d *Diskv) basePaths() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.basePathsWithLock()
+}
+
+func (d *Diskv) basePathsWithLock() []string {
+	return uniquePaths(append([]string{d.BasePath}, d.legacyBasePaths...), "")
+}
+
+func uniquePaths(paths []string, exclude string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		clean := filepath.Clean(path)
+		if exclude != "" {
+			excluded, err := samePath(clean, exclude)
+			if err == nil && excluded {
+				continue
+			}
+		}
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, path)
+	}
+	return out
+}
+
+func samePath(a, b string) (bool, error) {
+	absA, err := filepath.Abs(a)
+	if err != nil {
+		return false, err
+	}
+	absB, err := filepath.Abs(b)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(absA) == filepath.Clean(absB), nil
+}
+
+func pathContains(parent, child string) (bool, error) {
+	absParent, err := filepath.Abs(parent)
+	if err != nil {
+		return false, err
+	}
+	absChild, err := filepath.Abs(child)
+	if err != nil {
+		return false, err
+	}
+
+	rel, err := filepath.Rel(filepath.Clean(absParent), filepath.Clean(absChild))
+	if err != nil {
+		return false, err
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
 }
 
 // cacheWithLock attempts to cache the given key-value pair in the store's
@@ -649,10 +1076,21 @@ func (d *Diskv) cacheWithLock(key string, val []byte) error {
 }
 
 // cacheWithoutLock acquires the store's (write) mutex and calls cacheWithLock.
-func (d *Diskv) cacheWithoutLock(key string, val []byte) error {
+func (d *Diskv) cacheWithoutLock(key string, generation uint64, val []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.generations[key] != generation {
+		return nil
+	}
 	return d.cacheWithLock(key, val)
+}
+
+func (d *Diskv) bumpGenerationWithLock(key string) {
+	d.generations[key]++
+}
+
+func (d *Diskv) generationWithRLock(key string) uint64 {
+	return d.generations[key]
 }
 
 func (d *Diskv) bustCacheWithLock(key string) {
@@ -670,25 +1108,31 @@ func (d *Diskv) uncacheWithLock(key string, sz uint64) {
 // key k. Typically this function is called after an Erase is made.
 func (d *Diskv) pruneDirsWithLock(key string) error {
 	pathlist := d.transform(key).Path
-	for i := range pathlist {
-		dir := filepath.Join(d.BasePath, filepath.Join(pathlist[:len(pathlist)-i]...))
+	for _, basePath := range d.basePathsWithLock() {
+		for i := range pathlist {
+			dir := filepath.Join(basePath, filepath.Join(pathlist[:len(pathlist)-i]...))
 
-		// thanks to Steven Blenkinsop for this snippet
-		switch fi, err := os.Stat(dir); true {
-		case err != nil:
-			return err
-		case !fi.IsDir():
-			panic(fmt.Sprintf("corrupt dirstate at %s", dir))
-		}
+			// thanks to Steven Blenkinsop for this snippet
+			fi, err := os.Stat(dir)
+			if os.IsNotExist(err) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if !fi.IsDir() {
+				panic(fmt.Sprintf("corrupt dirstate at %s", dir))
+			}
 
-		nlinks, err := filepath.Glob(filepath.Join(dir, "*"))
-		if err != nil {
-			return err
-		} else if len(nlinks) > 0 {
-			return nil // has subdirs -- do not prune
-		}
-		if err = os.Remove(dir); err != nil {
-			return err
+			nlinks, err := filepath.Glob(filepath.Join(dir, "*"))
+			if err != nil {
+				return err
+			} else if len(nlinks) > 0 {
+				break // has subdirs -- do not prune
+			}
+			if err = os.Remove(dir); err != nil {
+				return err
+			}
 		}
 	}
 
