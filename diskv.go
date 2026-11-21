@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/ioutil"
 	"os"
@@ -32,13 +33,87 @@ type PathKey struct {
 }
 
 var (
-	defaultAdvancedTransform = func(s string) *PathKey { return &PathKey{Path: []string{}, FileName: s} }
-	defaultInverseTransform  = func(pathKey *PathKey) string { return pathKey.FileName }
+	defaultAdvancedTransform = func(s string) *PathKey {
+		return &PathKey{Path: shardPath(s), FileName: escapeKey(s)}
+	}
+	defaultInverseTransform  = func(pathKey *PathKey) string { return unescapeKey(pathKey.FileName) }
+	identityInverseTransform = func(pathKey *PathKey) string { return pathKey.FileName }
 	errCanceled              = errors.New("canceled")
 	errEmptyKey              = errors.New("empty key")
 	errBadKey                = errors.New("bad key")
 	errImportDirectory       = errors.New("can't import a directory")
 )
+
+// shardPath maps a key to a fixed-depth pair of shard directories derived
+// from a hash of the key. The number of directories converges to a bounded
+// maximum (256 + 65536) instead of growing with the number of keys, and the
+// mapping is stable: a given key always hashes to the same path.
+func shardPath(key string) []string {
+	h := fnv.New32a()
+	h.Write([]byte(key)) // writes to a hash never fail
+	sum := h.Sum32()
+	return []string{
+		fmt.Sprintf("%02x", uint8(sum>>24)),
+		fmt.Sprintf("%02x", uint8(sum>>16)),
+	}
+}
+
+// escapeKey encodes a key so it can be stored as a single file name,
+// regardless of any path separators it contains. Every '%' and '/' is
+// percent-encoded, which keeps the mapping reversible via unescapeKey.
+func escapeKey(key string) string {
+	if !strings.ContainsAny(key, "%/") {
+		return key
+	}
+	var buf bytes.Buffer
+	for i := 0; i < len(key); i++ {
+		switch c := key[i]; c {
+		case '%', '/':
+			fmt.Fprintf(&buf, "%%%02X", c)
+		default:
+			buf.WriteByte(c)
+		}
+	}
+	return buf.String()
+}
+
+// unescapeKey reverses escapeKey. Sequences that aren't valid percent
+// encodings are left as-is, so foreign files in the store don't break
+// key enumeration.
+func unescapeKey(escaped string) string {
+	if !strings.ContainsRune(escaped, '%') {
+		return escaped
+	}
+	var buf bytes.Buffer
+	for i := 0; i < len(escaped); i++ {
+		c := escaped[i]
+		if c != '%' || i+2 >= len(escaped) {
+			buf.WriteByte(c)
+			continue
+		}
+		hi, ok1 := unhex(escaped[i+1])
+		lo, ok2 := unhex(escaped[i+2])
+		if !ok1 || !ok2 {
+			buf.WriteByte(c)
+			continue
+		}
+		buf.WriteByte(hi<<4 | lo)
+		i += 2
+	}
+	return buf.String()
+}
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
 
 // TransformFunction transforms a key into a slice of strings, with each
 // element in the slice representing a directory in the file path where the
@@ -93,9 +168,10 @@ type Options struct {
 // structures directly; instead, use the New constructor.
 type Diskv struct {
 	Options
-	mu        sync.RWMutex
-	cache     map[string][]byte
-	cacheSize uint64
+	mu             sync.RWMutex
+	cache          map[string][]byte
+	cacheSize      uint64
+	prefixWalkable bool
 }
 
 // New returns an initialized Diskv structure, ready to use.
@@ -106,14 +182,19 @@ func New(o Options) *Diskv {
 		o.BasePath = defaultBasePath
 	}
 
+	customTransform := o.AdvancedTransform != nil || o.Transform != nil
+
 	if o.AdvancedTransform == nil {
 		if o.Transform == nil {
 			o.AdvancedTransform = defaultAdvancedTransform
+			if o.InverseTransform == nil {
+				o.InverseTransform = defaultInverseTransform
+			}
 		} else {
 			o.AdvancedTransform = convertToAdvancedTransform(o.Transform)
-		}
-		if o.InverseTransform == nil {
-			o.InverseTransform = defaultInverseTransform
+			if o.InverseTransform == nil {
+				o.InverseTransform = identityInverseTransform
+			}
 		}
 	} else {
 		if o.InverseTransform == nil {
@@ -129,9 +210,10 @@ func New(o Options) *Diskv {
 	}
 
 	d := &Diskv{
-		Options:   o,
-		cache:     map[string][]byte{},
-		cacheSize: 0,
+		Options:        o,
+		cache:          map[string][]byte{},
+		cacheSize:      0,
+		prefixWalkable: customTransform,
 	}
 
 	if d.Index != nil && d.IndexLess != nil {
@@ -562,7 +644,9 @@ func (d *Diskv) Keys(cancel <-chan struct{}) <-chan string {
 // provided prefix is the empty string, all keys will be yielded.
 func (d *Diskv) KeysPrefix(prefix string, cancel <-chan struct{}) <-chan string {
 	var prepath string
-	if prefix == "" {
+	if prefix == "" || !d.prefixWalkable {
+		// The default transform shards keys by hash, so key prefixes don't
+		// map to path prefixes: scan the whole store and filter instead.
 		prepath = d.BasePath
 	} else {
 		prefixKey := d.transform(prefix)
@@ -681,11 +765,12 @@ func (d *Diskv) pruneDirsWithLock(key string) error {
 			panic(fmt.Sprintf("corrupt dirstate at %s", dir))
 		}
 
-		nlinks, err := filepath.Glob(filepath.Join(dir, "*"))
+		entries, err := ioutil.ReadDir(dir)
 		if err != nil {
 			return err
-		} else if len(nlinks) > 0 {
-			return nil // has subdirs -- do not prune
+		}
+		if len(entries) > 0 {
+			return nil // not empty -- do not prune
 		}
 		if err = os.Remove(dir); err != nil {
 			return err

@@ -86,6 +86,15 @@ behavior is available in the content-addressable-storage example.
 
 [6]: http://groups.google.com/group/redis-db/browse_thread/thread/d444bc786689bde9?pli=1
 
+If you don't provide any transform at all, diskv uses a built-in default that
+accepts arbitrary keys — including keys containing slashes, such as
+hierarchical business IDs. The key is percent-escaped into a single file
+name, and files are sharded into a fixed two-level directory structure
+derived from a hash of the key. The key-to-path mapping is stable, and the
+number of directories converges to a bounded maximum (256 + 65536) instead
+of growing with the number of keys, so listing and scanning the store stays
+fast. Erasing keys also removes the directories they lived in, once empty.
+
 **Note** that your TransformFunc should ensure that one valid key doesn't
 transform to a subset of another valid key. That is, it shouldn't be possible
 to construct valid keys that resolve to directory names. As a concrete example,

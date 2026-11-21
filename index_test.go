@@ -145,10 +145,16 @@ func TestIndexKeysEmptyFrom(t *testing.T) {
 
 func TestBadKeys(t *testing.T) {
 	d := New(Options{
-		BasePath:     "index-test",
-		CacheSizeMax: 1024,
-		Index:        &BTreeIndex{},
-		IndexLess:    strLess,
+		BasePath: "index-test",
+		// A transform that lets a path separator slip into a path element
+		// or file name must be rejected.
+		AdvancedTransform: func(s string) *PathKey {
+			return &PathKey{Path: []string{s}, FileName: s}
+		},
+		InverseTransform: func(pathKey *PathKey) string { return pathKey.FileName },
+		CacheSizeMax:     1024,
+		Index:            &BTreeIndex{},
+		IndexLess:        strLess,
 	})
 	defer d.EraseAll()
 

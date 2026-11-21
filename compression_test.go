@@ -2,7 +2,6 @@ package diskv
 
 import (
 	"compress/flate"
-	"fmt"
 	"math/rand"
 	"os"
 	"testing"
@@ -32,7 +31,7 @@ func testCompressionWith(t *testing.T, c Compression, name string) {
 		t.Fatalf("write failed: %s", err)
 	}
 
-	targetFile := fmt.Sprintf("%s%c%s", d.BasePath, os.PathSeparator, key)
+	targetFile := d.completeFilename(d.transform(key))
 	fi, err := os.Stat(targetFile)
 	if err != nil {
 		t.Fatalf("%s: %s", targetFile, err)
