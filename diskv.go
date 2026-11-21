@@ -395,15 +395,15 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 
 	fi, err := os.Stat(filename)
 	if err != nil {
-		return nil, err
+		return nil, d.missOnRead(pathKey.originalKey, err)
 	}
 	if fi.IsDir() {
-		return nil, os.ErrNotExist
+		return nil, d.missOnRead(pathKey.originalKey, os.ErrNotExist)
 	}
 
 	f, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return nil, d.missOnRead(pathKey.originalKey, err)
 	}
 
 	var r io.Reader
@@ -422,6 +422,23 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 	}
 
 	return rc, nil
+}
+
+// missOnRead handles a failed read of a key's data file. If the failure is
+// because the file no longer exists -- e.g. it was removed by an external
+// process, leaving a stale entry in the index -- the key is lazily deleted
+// from the index, and the error is collapsed to os.ErrNotExist so callers
+// can treat it as an ordinary cache miss with os.IsNotExist. Any other error
+// is returned unchanged. The hit path is unaffected: no extra syscalls are
+// made unless the read has already failed.
+func (d *Diskv) missOnRead(key string, err error) error {
+	if !os.IsNotExist(err) {
+		return err
+	}
+	if d.Index != nil {
+		d.Index.Delete(key)
+	}
+	return os.ErrNotExist
 }
 
 // closingReader provides a Reader that automatically closes the
