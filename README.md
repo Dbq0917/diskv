@@ -177,6 +177,79 @@ compressed; the cost of decompression is borne with each Read.
 diskv also now provides ReadStream and WriteStream methods, to allow very large
 data to be handled efficiently.
 
+## Sharding large stores
+
+The default flat layout puts every data file in a single directory. On most
+filesystems a directory with hundreds of thousands of entries is expensive to
+scan: a full key listing, a prefix lookup, and bulk cleanup all degrade into
+linear walks of the whole directory, and `readdir` latency keeps growing with
+the entry count.
+
+`PrefixLayout` provides a fixed-depth, prefix-based sharding layout designed
+for large, hash-keyed stores such as image caches:
+
+```go
+// 2-character hex shards, one level deep, "_" pads keys shorter than 2
+// chars. One million keys spread across at most 256 leaf directories
+// (~3900 files each); the directory count is bounded, so inode usage stays
+// flat.
+layout, err := diskv.NewPrefixLayout("0123456789abcdef", 2, 1, "_")
+if err != nil {
+    panic(err)
+}
+
+d := diskv.New(diskv.Options{
+    BasePath:          "image-cache",
+    AdvancedTransform: layout.AdvancedTransform,
+    InverseTransform:  layout.InverseTransform,
+    PrefixLocator:     layout, // enables prefix-aware KeysPrefix
+})
+
+// Key e2fc0e... is stored at image-cache/e2/e2fc0e...
+d.WriteString("e2fc0e1234abcd", "...")
+
+// KeysPrefix only walks image-cache/e2 instead of the whole store.
+for key := range d.KeysPrefix("e2fc", nil) {
+    fmt.Println(key)
+}
+```
+
+Properties of the layout:
+
+* The directory depth is fixed and the shard count is bounded by
+  `len(alphabet)^width` per level, independent of the number of keys. Data
+  files only exist at the leaf level, so a key can never collide with a
+  directory name (the failure mode described in the Basic idea section).
+* Shards are taken from the leading characters of the key, so a key prefix
+  maps directly to a directory subtree. With `PrefixLocator` set, `KeysPrefix`
+  enumerates only the matching subtrees; without it, behavior is unchanged and
+  the whole base path is walked.
+* The full key remains the file name, so the data stays inspectable and
+  recoverable with ordinary UNIX tools.
+
+### Sizing the shards
+
+Choose `width` and `depth` so the number of possible leaf directories
+(`len(alphabet)^width` raised to `depth`) is comfortably smaller than the
+expected number of keys. A leaf directory should hold hundreds to low
+thousands of files, not a handful.
+
+For one million hexadecimal keys, a single 2-character level gives 256 leaves
+of ~3900 files. Adding a second 2-character level raises the leaf cap to
+65536, which over-shards the same dataset: most leaves stay nearly empty, the
+directory (inode) count explodes, and full-store listings slow down. The
+million-key scale test reports both layouts side by side; the rule of thumb
+is to add another level only when a leaf directory itself grows past roughly
+10k entries.
+
+A runnable version lives in
+`examples/sharded-image-cache`, and a million-key flat-vs-sharded comparison
+is available via the `DISKV_SCALE_KEYS` environment variable:
+
+```bash
+$ DISKV_SCALE_KEYS=1000000 go test -run TestScaleMillionKeys -v -timeout 2h
+```
+
 
 # Future plans
 

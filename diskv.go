@@ -87,6 +87,12 @@ type Options struct {
 	IndexLess LessFunction
 
 	Compression Compression
+
+	// PrefixLocator, when set, allows KeysPrefix to map a key prefix to the
+	// specific sharding directories that may contain matching keys, instead of
+	// walking the whole BasePath. Transform implementations whose shards are
+	// derived from leading key characters (see PrefixLayout) should provide it.
+	PrefixLocator PrefixLocator
 }
 
 // Diskv implements the Diskv interface. You shouldn't construct Diskv
@@ -561,19 +567,43 @@ func (d *Diskv) Keys(cancel <-chan struct{}) <-chan string {
 // provided, closing it will terminate and close the keys channel. If the
 // provided prefix is the empty string, all keys will be yielded.
 func (d *Diskv) KeysPrefix(prefix string, cancel <-chan struct{}) <-chan string {
-	var prepath string
-	if prefix == "" {
-		prepath = d.BasePath
-	} else {
-		prefixKey := d.transform(prefix)
-		prepath = d.pathFor(prefixKey)
-	}
 	c := make(chan string)
 	go func() {
-		filepath.Walk(prepath, d.walker(c, prefix, cancel))
-		close(c)
+		defer close(c)
+		if d.PrefixLocator != nil {
+			d.walkPrefixRoots(c, prefix, cancel)
+			return
+		}
+
+		var prepath string
+		if prefix == "" {
+			prepath = d.BasePath
+		} else {
+			prefixKey := d.transform(prefix)
+			prepath = d.pathFor(prefixKey)
+		}
+		d.walkAndIgnore(prepath, c, prefix, cancel)
 	}()
 	return c
+}
+
+// walkPrefixRoots enumerates only the directory subtrees reported by the
+// PrefixLocator. A root that does not exist yet simply has no matching keys.
+func (d *Diskv) walkPrefixRoots(c chan<- string, prefix string, cancel <-chan struct{}) {
+	for _, root := range d.PrefixLocator.PrefixRoots(prefix) {
+		prepath := filepath.Join(d.BasePath, filepath.Join(root...))
+		err := d.walkAndIgnore(prepath, c, prefix, cancel)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (d *Diskv) walkAndIgnore(prepath string, c chan<- string, prefix string, cancel <-chan struct{}) error {
+	return filepath.Walk(prepath, d.walker(c, prefix, cancel))
 }
 
 // walker returns a function which satisfies the filepath.WalkFunc interface.
