@@ -13,7 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 const (
@@ -38,6 +40,7 @@ var (
 	errEmptyKey              = errors.New("empty key")
 	errBadKey                = errors.New("bad key")
 	errImportDirectory       = errors.New("can't import a directory")
+	errMultipleExpiry        = errors.New("multiple expiration times")
 )
 
 // TransformFunction transforms a key into a slice of strings, with each
@@ -87,15 +90,26 @@ type Options struct {
 	IndexLess LessFunction
 
 	Compression Compression
+
+	// CleanupInterval enables a background expiration sweeper. A zero value
+	// disables the sweeper; expired keys are still hidden from reads and are
+	// removed opportunistically or by CleanExpired.
+	CleanupInterval time.Duration
+	// SweepInterval is kept as an alias for CleanupInterval.
+	SweepInterval time.Duration
 }
 
 // Diskv implements the Diskv interface. You shouldn't construct Diskv
 // structures directly; instead, use the New constructor.
 type Diskv struct {
 	Options
-	mu        sync.RWMutex
-	cache     map[string][]byte
-	cacheSize uint64
+	mu               sync.RWMutex
+	cache            map[string][]byte
+	cacheSize        uint64
+	cleanupMu        sync.Mutex
+	cleanupScheduled uint32
+	stopCh           chan struct{}
+	stopOnce         sync.Once
 }
 
 // New returns an initialized Diskv structure, ready to use.
@@ -127,6 +141,9 @@ func New(o Options) *Diskv {
 	if o.FilePerm == 0 {
 		o.FilePerm = defaultFilePerm
 	}
+	if o.CleanupInterval == 0 {
+		o.CleanupInterval = o.SweepInterval
+	}
 
 	d := &Diskv{
 		Options:   o,
@@ -136,6 +153,11 @@ func New(o Options) *Diskv {
 
 	if d.Index != nil && d.IndexLess != nil {
 		d.Index.Initialize(d.IndexLess, d.Keys(nil))
+	}
+
+	if d.CleanupInterval > 0 {
+		d.stopCh = make(chan struct{})
+		go d.expirationLoop()
 	}
 
 	return d
@@ -152,13 +174,51 @@ func convertToAdvancedTransform(oldFunc func(s string) []string) AdvancedTransfo
 // Write synchronously writes the key-value pair to disk, making it immediately
 // available for reads. Write relies on the filesystem to perform an eventual
 // sync to physical media. If you need stronger guarantees, see WriteStream.
-func (d *Diskv) Write(key string, val []byte) error {
-	return d.WriteStream(key, bytes.NewReader(val), false)
+//
+// An optional expiration time may be supplied. Once it passes, the key is
+// treated as if it did not exist. A zero time means the key does not expire.
+func (d *Diskv) Write(key string, val []byte, expiresAt ...time.Time) error {
+	expiry, err := singleExpiry(expiresAt)
+	if err != nil {
+		return err
+	}
+	return d.WriteStream(key, bytes.NewReader(val), false, expiry)
 }
 
-// WriteString writes a string key-value pair to disk
-func (d *Diskv) WriteString(key string, val string) error {
-	return d.Write(key, []byte(val))
+// WriteString writes a string key-value pair to disk. An optional expiration
+// time may be supplied; see Write.
+func (d *Diskv) WriteString(key string, val string, expiresAt ...time.Time) error {
+	return d.Write(key, []byte(val), expiresAt...)
+}
+
+// WriteWithExpiry writes val under key and makes it expire at expiresAt.
+func (d *Diskv) WriteWithExpiry(key string, val []byte, expiresAt time.Time) error {
+	return d.Write(key, val, expiresAt)
+}
+
+// WriteStringWithExpiry writes val under key and makes it expire at expiresAt.
+func (d *Diskv) WriteStringWithExpiry(key string, val string, expiresAt time.Time) error {
+	return d.WriteString(key, val, expiresAt)
+}
+
+// WriteWithExpiration is an alias for WriteWithExpiry.
+func (d *Diskv) WriteWithExpiration(key string, val []byte, expiresAt time.Time) error {
+	return d.WriteWithExpiry(key, val, expiresAt)
+}
+
+// WriteStringWithExpiration is an alias for WriteStringWithExpiry.
+func (d *Diskv) WriteStringWithExpiration(key string, val string, expiresAt time.Time) error {
+	return d.WriteStringWithExpiry(key, val, expiresAt)
+}
+
+// WriteWithTTL writes val under key and makes it expire after ttl.
+func (d *Diskv) WriteWithTTL(key string, val []byte, ttl time.Duration) error {
+	return d.WriteWithExpiry(key, val, time.Now().Add(ttl))
+}
+
+// WriteStringWithTTL writes val under key and makes it expire after ttl.
+func (d *Diskv) WriteStringWithTTL(key string, val string, ttl time.Duration) error {
+	return d.WriteStringWithExpiry(key, val, time.Now().Add(ttl))
 }
 
 func (d *Diskv) transform(key string) (pathKey *PathKey) {
@@ -172,7 +232,15 @@ func (d *Diskv) transform(key string) (pathKey *PathKey) {
 // the file as soon as it's written.
 //
 // bytes.Buffer provides io.Reader semantics for basic data types.
-func (d *Diskv) WriteStream(key string, r io.Reader, sync bool) error {
+//
+// An optional expiration time may be supplied. Once it passes, the key is
+// treated as if it did not exist. A zero time means the key does not expire.
+func (d *Diskv) WriteStream(key string, r io.Reader, sync bool, expiresAt ...time.Time) error {
+	expiry, err := singleExpiry(expiresAt)
+	if err != nil {
+		return err
+	}
+
 	if len(key) <= 0 {
 		return errEmptyKey
 	}
@@ -193,7 +261,33 @@ func (d *Diskv) WriteStream(key string, r io.Reader, sync bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	return d.writeStreamWithLock(pathKey, r, sync)
+	return d.writeStreamWithLock(pathKey, r, sync, expiry)
+}
+
+// WriteStreamWithExpiry writes the stream under key with an absolute expiry.
+func (d *Diskv) WriteStreamWithExpiry(key string, r io.Reader, sync bool, expiresAt time.Time) error {
+	return d.WriteStream(key, r, sync, expiresAt)
+}
+
+// WriteStreamWithExpiration is an alias for WriteStreamWithExpiry.
+func (d *Diskv) WriteStreamWithExpiration(key string, r io.Reader, sync bool, expiresAt time.Time) error {
+	return d.WriteStream(key, r, sync, expiresAt)
+}
+
+// WriteStreamWithTTL writes the stream under key with a relative TTL.
+func (d *Diskv) WriteStreamWithTTL(key string, r io.Reader, sync bool, ttl time.Duration) error {
+	return d.WriteStream(key, r, sync, time.Now().Add(ttl))
+}
+
+func singleExpiry(expiresAt []time.Time) (time.Time, error) {
+	switch len(expiresAt) {
+	case 0:
+		return time.Time{}, nil
+	case 1:
+		return expiresAt[0], nil
+	default:
+		return time.Time{}, errMultipleExpiry
+	}
 }
 
 // createKeyFileWithLock either creates the key file directly, or
@@ -225,7 +319,7 @@ func (d *Diskv) createKeyFileWithLock(pathKey *PathKey) (*os.File, error) {
 }
 
 // writeStream does no input validation checking.
-func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) error {
+func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool, expiresAt time.Time) error {
 	if err := d.ensurePathWithLock(pathKey); err != nil {
 		return fmt.Errorf("ensure path: %s", err)
 	}
@@ -277,6 +371,11 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 		}
 	}
 
+	if err := d.setExpiryWithLock(pathKey, expiresAt); err != nil {
+		os.Remove(fullPath) // error deliberately ignored
+		return fmt.Errorf("set expiration: %s", err)
+	}
+
 	if d.Index != nil {
 		d.Index.Insert(pathKey.originalKey)
 	}
@@ -311,6 +410,9 @@ func (d *Diskv) Import(srcFilename, dstKey string, move bool) (err error) {
 
 	if move {
 		if err := syscall.Rename(srcFilename, d.completeFilename(dstPathKey)); err == nil {
+			if err := d.setExpiryWithLock(dstPathKey, time.Time{}); err != nil {
+				return fmt.Errorf("clear expiration: %s", err)
+			}
 			d.bustCacheWithLock(dstPathKey.originalKey)
 			return nil
 		} else if err != syscall.EXDEV {
@@ -324,7 +426,7 @@ func (d *Diskv) Import(srcFilename, dstKey string, move bool) (err error) {
 		return err
 	}
 	defer f.Close()
-	err = d.writeStreamWithLock(dstPathKey, f, false)
+	err = d.writeStreamWithLock(dstPathKey, f, false, time.Time{})
 	if err == nil && move {
 		err = os.Remove(srcFilename)
 	}
@@ -400,6 +502,14 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 	if fi.IsDir() {
 		return nil, os.ErrNotExist
 	}
+	expiresAt, expiring := expiryFromFileInfo(fi)
+	if expiring && !expiresAt.After(time.Now()) {
+		if d.Index != nil {
+			d.Index.Delete(pathKey.originalKey)
+		}
+		d.scheduleCleanup()
+		return nil, os.ErrNotExist
+	}
 
 	f, err := os.Open(filename)
 	if err != nil {
@@ -407,7 +517,7 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 	}
 
 	var r io.Reader
-	if d.CacheSizeMax > 0 {
+	if d.CacheSizeMax > 0 && !expiring {
 		r = newSiphon(f, d, pathKey.originalKey)
 	} else {
 		r = &closingReader{f}
@@ -545,6 +655,13 @@ func (d *Diskv) Has(key string) bool {
 	if s.IsDir() {
 		return false
 	}
+	if expiresAt, ok := expiryFromFileInfo(s); ok && !expiresAt.After(time.Now()) {
+		if d.Index != nil {
+			d.Index.Delete(key)
+		}
+		d.scheduleCleanup()
+		return false
+	}
 
 	return true
 }
@@ -599,6 +716,9 @@ func (d *Diskv) walker(c chan<- string, prefix string, cancel <-chan struct{}) f
 		if info.IsDir() || !strings.HasPrefix(key, prefix) {
 			return nil // "pass"
 		}
+		if expiresAt, ok := expiryFromFileInfo(info); ok && !expiresAt.After(time.Now()) {
+			return nil // expired keys are no longer accessible
+		}
 
 		select {
 		case c <- key:
@@ -625,6 +745,200 @@ func (d *Diskv) ensurePathWithLock(pathKey *PathKey) error {
 // completeFilename returns the absolute path to the file for the given key.
 func (d *Diskv) completeFilename(pathKey *PathKey) string {
 	return filepath.Join(d.pathFor(pathKey), pathKey.FileName)
+}
+
+// expiryFromFileInfo returns the absolute expiration time encoded in fi.
+// Expiring files carry the sticky bit as a marker; files without it are
+// non-expiring, including files written before expiration support existed.
+func expiryFromFileInfo(fi os.FileInfo) (time.Time, bool) {
+	if fi.Mode()&os.ModeSticky == 0 {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
+}
+
+// setExpiryWithLock records expiresAt in the key file's metadata. A zero time
+// removes the expiration marker. Only metadata changes: the file content,
+// name, and directory layout are untouched.
+func (d *Diskv) setExpiryWithLock(pathKey *PathKey, expiresAt time.Time) error {
+	filename := d.completeFilename(pathKey)
+
+	fi, err := os.Stat(filename)
+	if err != nil {
+		return err
+	}
+	mode := fi.Mode()
+
+	if expiresAt.IsZero() {
+		if mode&os.ModeSticky == 0 {
+			return nil
+		}
+		return os.Chmod(filename, mode&^os.ModeSticky)
+	}
+
+	if mode&os.ModeSticky == 0 {
+		if err := os.Chmod(filename, mode|os.ModeSticky); err != nil {
+			return err
+		}
+	}
+	return os.Chtimes(filename, time.Now(), expiresAt)
+}
+
+// ExpiresAt returns the expiration time for key. The boolean is false when the
+// key does not exist, has already expired, or never expires.
+func (d *Diskv) ExpiresAt(key string) (time.Time, bool, error) {
+	pathKey := d.transform(key)
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	fi, err := os.Stat(d.completeFilename(pathKey))
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if fi.IsDir() {
+		return time.Time{}, false, os.ErrNotExist
+	}
+	expiresAt, ok := expiryFromFileInfo(fi)
+	if !ok || !expiresAt.After(time.Now()) {
+		return time.Time{}, false, nil
+	}
+	return expiresAt, true, nil
+}
+
+// CleanExpired removes keys whose expiration time has passed. It scans without
+// holding the store lock that guards reads and writes, then revalidates each
+// candidate under that lock before removing it. Keys rewritten or extended
+// while the scan is in progress are therefore left alone.
+func (d *Diskv) CleanExpired() error {
+	d.cleanupMu.Lock()
+	defer d.cleanupMu.Unlock()
+
+	type candidate struct {
+		path string
+		key  string
+	}
+
+	var candidates []candidate
+	now := time.Now()
+	err := filepath.Walk(d.BasePath, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		expiresAt, expiring := expiryFromFileInfo(info)
+		if !expiring || expiresAt.After(now) {
+			return nil
+		}
+		key, err := d.keyForPath(path)
+		if err != nil {
+			return nil
+		}
+		candidates = append(candidates, candidate{path: path, key: key})
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	var firstErr error
+	for _, candidate := range candidates {
+		if err := d.eraseExpired(candidate.path, candidate.key); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// Sweep is an alias for CleanExpired.
+func (d *Diskv) Sweep() error { return d.CleanExpired() }
+
+// EraseExpired is an alias for CleanExpired.
+func (d *Diskv) EraseExpired() error { return d.CleanExpired() }
+
+func (d *Diskv) eraseExpired(path, key string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.IsDir() {
+		return nil
+	}
+	expiresAt, expiring := expiryFromFileInfo(fi)
+	if !expiring || expiresAt.After(time.Now()) {
+		return nil
+	}
+
+	d.bustCacheWithLock(key)
+	if d.Index != nil {
+		d.Index.Delete(key)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	d.pruneDirsWithLock(key) // best effort
+	return nil
+}
+
+// keyForPath reverses the configured transform for a path below BasePath.
+func (d *Diskv) keyForPath(path string) (string, error) {
+	relPath, err := filepath.Rel(d.BasePath, path)
+	if err != nil {
+		return "", err
+	}
+	dir, file := filepath.Split(relPath)
+	pathSplit := strings.Split(dir, string(filepath.Separator))
+	pathSplit = pathSplit[:len(pathSplit)-1]
+	pathKey := &PathKey{Path: pathSplit, FileName: file}
+	return d.InverseTransform(pathKey), nil
+}
+
+func (d *Diskv) expirationLoop() {
+	ticker := time.NewTicker(d.CleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			d.CleanExpired()
+		case <-d.stopCh:
+			return
+		}
+	}
+}
+
+// scheduleCleanup performs one background sweep when no janitor is configured.
+// It coalesces bursts of expired reads into a single scan.
+func (d *Diskv) scheduleCleanup() {
+	if d.CleanupInterval > 0 {
+		return
+	}
+	if !atomic.CompareAndSwapUint32(&d.cleanupScheduled, 0, 1) {
+		return
+	}
+	go func() {
+		defer atomic.StoreUint32(&d.cleanupScheduled, 0)
+		d.CleanExpired()
+	}()
+}
+
+// Close stops the background expiration sweeper, if one was configured.
+func (d *Diskv) Close() error {
+	d.stopOnce.Do(func() {
+		if d.stopCh != nil {
+			close(d.stopCh)
+		}
+	})
+	return nil
 }
 
 // cacheWithLock attempts to cache the given key-value pair in the store's

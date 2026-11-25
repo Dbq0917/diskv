@@ -177,6 +177,47 @@ compressed; the cost of decompression is borne with each Read.
 diskv also now provides ReadStream and WriteStream methods, to allow very large
 data to be handled efficiently.
 
+## Key expiration
+
+Writes may carry an absolute expiration time. Once that time passes, reads
+behave as if the key does not exist:
+
+```go
+expiresAt := time.Now().Add(time.Hour)
+if err := d.WriteWithExpiry("session", []byte("token"), expiresAt); err != nil {
+	log.Fatal(err)
+}
+
+// The same expiry can be supplied directly to the regular write methods.
+d.WriteString("temporary", "value", expiresAt)
+d.WriteStream("large", reader, false, expiresAt)
+```
+
+The expiration is stored in the key file's existing metadata: its modification
+time holds the absolute expiry, and the sticky bit marks it as expiring. Files
+without that marker, including files written by older versions of diskv, never
+expire. This keeps the one-file-per-key directory layout unchanged. Reads
+already `stat` the file, so checking expiration adds no system call to the read
+path; cache hits avoid the disk entirely.
+
+The sticky bit is reserved for the expiration marker. Expiring values are not
+put in the in-memory cache, so a cached copy can never outlive its expiration.
+
+Expired keys are hidden immediately by `Read`, `Has`, and key enumeration.
+`CleanExpired` (also available as `Sweep` or `EraseExpired`) removes expired
+files. Its directory scan runs without the store lock, and every candidate is
+revalidated under the lock before deletion, so a key rewritten with a later
+expiry is not removed. Expired reads also schedule a background sweep. To run a
+periodic sweeper, set `CleanupInterval` and call `Close` when finished:
+
+```go
+d := diskv.New(diskv.Options{
+	BasePath:        "my-data-dir",
+	CleanupInterval: time.Minute,
+})
+defer d.Close()
+```
+
 
 # Future plans
 
