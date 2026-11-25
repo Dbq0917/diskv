@@ -628,19 +628,33 @@ func (d *Diskv) completeFilename(pathKey *PathKey) string {
 }
 
 // cacheWithLock attempts to cache the given key-value pair in the store's
-// cache. It can fail if the value is larger than the cache's maximum size.
+// cache. It never panics: if the value cannot fit in the cache, even after
+// evicting other entries, the value is simply not cached and the existing
+// cache contents are left untouched. The returned error is non-nil only when
+// the value was not cached.
 func (d *Diskv) cacheWithLock(key string, val []byte) error {
-	// If the key already exists, delete it.
-	d.bustCacheWithLock(key)
-
 	valueSize := uint64(len(val))
-	if err := d.ensureCacheSpaceWithLock(valueSize); err != nil {
-		return fmt.Errorf("%s; not caching", err)
+	if d.CacheSizeMax == 0 {
+		return nil // caching is disabled
 	}
 
-	// be very strict about memory guarantees
-	if (d.cacheSize + valueSize) > d.CacheSizeMax {
-		panic(fmt.Sprintf("failed to make room for value (%d/%d)", valueSize, d.CacheSizeMax))
+	// A single value that exceeds the whole cache can never be cached. Drop it
+	// instead of evicting useful entries (or panicking): the caller still got
+	// the value from disk, and will simply go back to disk on the next read.
+	if valueSize > d.CacheSizeMax {
+		return fmt.Errorf("value size (%d bytes) too large for cache (%d bytes); not caching", valueSize, d.CacheSizeMax)
+	}
+
+	// If the key is already cached, account for removing the old value before
+	// deciding how much room the new value needs.
+	if old, ok := d.cache[key]; ok {
+		d.uncacheWithLock(key, uint64(len(old)))
+	}
+
+	// Make room by evicting other entries only. Evicting the key being cached
+	// would be pointless, and must never be needed since the value fits.
+	if !d.ensureCacheSpaceWithLock(key, valueSize) {
+		return fmt.Errorf("not enough room in cache for value (%d bytes, max %d bytes); not caching", valueSize, d.CacheSizeMax)
 	}
 
 	d.cache[key] = val
@@ -664,6 +678,38 @@ func (d *Diskv) bustCacheWithLock(key string) {
 func (d *Diskv) uncacheWithLock(key string, sz uint64) {
 	d.cacheSize -= sz
 	delete(d.cache, key)
+}
+
+// CachedKeys returns a snapshot of the keys currently held in the memory
+// cache. A key present in this slice is served from memory on the next read;
+// any key absent from it is read back from disk. The returned slice is a
+// copy and is safe to use without holding any locks.
+func (d *Diskv) CachedKeys() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	keys := make([]string, 0, len(d.cache))
+	for key := range d.cache {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// IsCached reports whether the given key is currently resident in the memory
+// cache. If true, the next read of that key is served without touching disk;
+// if false, the read goes back to the disk store.
+func (d *Diskv) IsCached(key string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	_, ok := d.cache[key]
+	return ok
+}
+
+// CacheSize returns the number of bytes currently occupied by cached values.
+// It is always less than or equal to CacheSizeMax.
+func (d *Diskv) CacheSize() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.cacheSize
 }
 
 // pruneDirsWithLock deletes empty directories in the path walk leading to the
@@ -695,28 +741,25 @@ func (d *Diskv) pruneDirsWithLock(key string) error {
 	return nil
 }
 
-// ensureCacheSpaceWithLock deletes entries from the cache in arbitrary order
-// until the cache has at least valueSize bytes available.
-func (d *Diskv) ensureCacheSpaceWithLock(valueSize uint64) error {
-	if valueSize > d.CacheSizeMax {
-		return fmt.Errorf("value size (%d bytes) too large for cache (%d bytes)", valueSize, d.CacheSizeMax)
-	}
-
-	safe := func() bool { return (d.cacheSize + valueSize) <= d.CacheSizeMax }
-
-	for key, val := range d.cache {
-		if safe() {
-			break
+// ensureCacheSpaceWithLock evicts entries other than keepKey from the cache,
+// in arbitrary (map-iteration) order, until valueSize more bytes would fit.
+// It returns true when enough room was made (or was already available), and
+// false if no combination of the remaining other entries could free enough.
+// It never panics and never removes keepKey.
+func (d *Diskv) ensureCacheSpaceWithLock(keepKey string, valueSize uint64) bool {
+	for (d.cacheSize + valueSize) > d.CacheSizeMax {
+		for key, val := range d.cache {
+			if key == keepKey {
+				continue
+			}
+			d.uncacheWithLock(key, uint64(len(val)))
+			if (d.cacheSize + valueSize) <= d.CacheSizeMax {
+				return true
+			}
 		}
-
-		d.uncacheWithLock(key, uint64(len(val)))
+		return false
 	}
-
-	if !safe() {
-		panic(fmt.Sprintf("%d bytes still won't fit in the cache! (max %d bytes)", valueSize, d.CacheSizeMax))
-	}
-
-	return nil
+	return true
 }
 
 // nopWriteCloser wraps an io.Writer and provides a no-op Close method to

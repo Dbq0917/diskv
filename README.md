@@ -154,6 +154,21 @@ functionality with a simple map structure, and keeping it up-to-date as
 appropriate. Since the map structure in Go is not threadsafe, it's combined
 with a RWMutex to provide safe concurrent access.
 
+`CacheSizeMax` is a hard limit on the number of bytes held in memory. Caching
+degrades gracefully rather than failing a read:
+
+- A value larger than the whole cache is never cached, but is still returned
+  from disk and does not displace existing entries.
+- When room is needed, other (never the key being cached) entries are evicted
+  until the new value fits. If it still cannot fit, the value is simply not
+  cached.
+- In no case does a read panic or abort the process because of cache pressure.
+  An uncached key is read from disk on its next read; a cached key is served
+  from memory.
+
+`CachedKeys`, `IsCached`, and `CacheSize` expose a lock-safe snapshot of what
+is currently resident in the cache and how many bytes it occupies.
+
 ## Adding order
 
 diskv is a key-value store and therefore inherently unordered. An ordering
