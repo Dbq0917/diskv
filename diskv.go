@@ -371,9 +371,16 @@ func (d *Diskv) ReadStream(key string, direct bool) (io.ReadCloser, error) {
 		if !direct {
 			buf := bytes.NewReader(val)
 			if d.Compression != nil {
-				return d.Compression.Reader(buf)
+				rc, err := d.Compression.Reader(buf)
+				if err != nil {
+					if rc != nil {
+						rc.Close() // error deliberately ignored
+					}
+					return nil, err
+				}
+				return newReadCloser(rc, rc), nil
 			}
-			return ioutil.NopCloser(buf), nil
+			return newReadCloser(buf), nil
 		}
 
 		go func() {
@@ -405,45 +412,85 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
+	file := &closeOnce{ReadCloser: f}
 
 	var r io.Reader
 	if d.CacheSizeMax > 0 {
-		r = newSiphon(f, d, pathKey.originalKey)
+		r = newSiphon(file, d, pathKey.originalKey)
 	} else {
-		r = &closingReader{f}
+		r = file
 	}
 
-	var rc = io.ReadCloser(ioutil.NopCloser(r))
 	if d.Compression != nil {
-		rc, err = d.Compression.Reader(r)
+		rc, err := d.Compression.Reader(r)
 		if err != nil {
+			if rc != nil {
+				rc.Close() // error deliberately ignored
+			}
+			file.Close() // error deliberately ignored
 			return nil, err
 		}
+		return newReadCloser(rc, rc, file), nil
 	}
 
-	return rc, nil
+	return newReadCloser(r, file), nil
 }
 
-// closingReader provides a Reader that automatically closes the
-// embedded ReadCloser when it reaches EOF
-type closingReader struct {
-	rc io.ReadCloser
+// readCloser closes all of its closers when it reaches EOF, encounters an
+// error, or is explicitly closed. Close is idempotent.
+type readCloser struct {
+	r       io.Reader
+	closers []io.Closer
+	once    sync.Once
+	err     error
 }
 
-func (cr closingReader) Read(p []byte) (int, error) {
-	n, err := cr.rc.Read(p)
-	if err == io.EOF {
-		if closeErr := cr.rc.Close(); closeErr != nil {
+func newReadCloser(r io.Reader, closers ...io.Closer) *readCloser {
+	return &readCloser{r: r, closers: closers}
+}
+
+func (rc *readCloser) Read(p []byte) (int, error) {
+	n, err := rc.r.Read(p)
+	if err != nil {
+		if closeErr := rc.Close(); closeErr != nil && err == io.EOF {
 			return n, closeErr // close must succeed for Read to succeed
 		}
 	}
 	return n, err
 }
 
+func (rc *readCloser) Close() error {
+	rc.once.Do(func() {
+		for _, c := range rc.closers {
+			if c == nil {
+				continue
+			}
+			if err := c.Close(); err != nil && rc.err == nil {
+				rc.err = err
+			}
+		}
+	})
+	return rc.err
+}
+
+// closeOnce makes closing the underlying ReadCloser idempotent.
+type closeOnce struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+func (c *closeOnce) Close() error {
+	c.once.Do(func() {
+		c.err = c.ReadCloser.Close()
+	})
+	return c.err
+}
+
 // siphon is like a TeeReader: it copies all data read through it to an
 // internal buffer, and moves that buffer to the cache at EOF.
 type siphon struct {
-	f   *os.File
+	f   io.ReadCloser
 	d   *Diskv
 	key string
 	buf *bytes.Buffer
@@ -452,7 +499,7 @@ type siphon struct {
 // newSiphon constructs a siphoning reader that represents the passed file.
 // When a successful series of reads ends in an EOF, the siphon will write
 // the buffered data to Diskv's cache under the given key.
-func newSiphon(f *os.File, d *Diskv, key string) io.Reader {
+func newSiphon(f io.ReadCloser, d *Diskv, key string) io.Reader {
 	return &siphon{
 		f:   f,
 		d:   d,
@@ -478,6 +525,12 @@ func (s *siphon) Read(p []byte) (int, error) {
 	}
 
 	return n, err
+}
+
+// Close closes the underlying file. It is safe to call after the siphon has
+// reached EOF.
+func (s *siphon) Close() error {
+	return s.f.Close()
 }
 
 // Erase synchronously erases the given key from the disk and the cache.
