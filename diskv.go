@@ -277,11 +277,12 @@ func (d *Diskv) writeStreamWithLock(pathKey *PathKey, r io.Reader, sync bool) er
 		}
 	}
 
+	// The value is only cached on read. Drop any stale cache or index entry
+	// before recording the newly written key.
+	d.invalidateWithLock(pathKey.originalKey)
 	if d.Index != nil {
 		d.Index.Insert(pathKey.originalKey)
 	}
-
-	d.bustCacheWithLock(pathKey.originalKey) // cache only on read
 
 	return nil
 }
@@ -395,14 +396,21 @@ func (d *Diskv) readWithRLock(pathKey *PathKey) (io.ReadCloser, error) {
 
 	fi, err := os.Stat(filename)
 	if err != nil {
+		if os.IsNotExist(err) {
+			d.invalidateIndexWithLock(pathKey.originalKey)
+		}
 		return nil, err
 	}
 	if fi.IsDir() {
+		d.invalidateIndexWithLock(pathKey.originalKey)
 		return nil, os.ErrNotExist
 	}
 
 	f, err := os.Open(filename)
 	if err != nil {
+		if os.IsNotExist(err) {
+			d.invalidateIndexWithLock(pathKey.originalKey)
+		}
 		return nil, err
 	}
 
@@ -486,12 +494,7 @@ func (d *Diskv) Erase(key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.bustCacheWithLock(key)
-
-	// erase from index
-	if d.Index != nil {
-		d.Index.Delete(key)
-	}
+	d.invalidateWithLock(key)
 
 	// erase from disk
 	filename := d.completeFilename(pathKey)
@@ -512,15 +515,14 @@ func (d *Diskv) Erase(key string) error {
 	return nil
 }
 
-// EraseAll will delete all of the data from the store, both in the cache and on
-// the disk. Note that EraseAll doesn't distinguish diskv-related data from non-
-// diskv-related data. Care should be taken to always specify a diskv base
-// directory that is exclusively for diskv data.
+// EraseAll will delete all of the data from the store: the cache, the external
+// index (if configured), and the disk. Note that EraseAll doesn't distinguish
+// diskv-related data from non-diskv-related data. Care should be taken to
+// always specify a diskv base directory that is exclusively for diskv data.
 func (d *Diskv) EraseAll() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.cache = make(map[string][]byte)
-	d.cacheSize = 0
+	d.invalidateAllWithLock()
 	if d.TempDir != "" {
 		os.RemoveAll(d.TempDir) // errors ignored
 	}
@@ -659,6 +661,56 @@ func (d *Diskv) bustCacheWithLock(key string) {
 	if val, ok := d.cache[key]; ok {
 		d.uncacheWithLock(key, uint64(len(val)))
 	}
+}
+
+// invalidateWithLock removes key from both in-memory states that can serve it:
+// the cache and the external index, if one is configured. The disk is the
+// source of truth and is deliberately left untouched.
+func (d *Diskv) invalidateWithLock(key string) {
+	d.bustCacheWithLock(key)
+	d.invalidateIndexWithLock(key)
+}
+
+// invalidateIndexWithLock removes key from the external index, if configured.
+// Callers must hold d.mu for reading or writing.
+func (d *Diskv) invalidateIndexWithLock(key string) {
+	if d.Index != nil {
+		d.Index.Delete(key)
+	}
+}
+
+// invalidateAllWithLock removes every key known to the in-memory states. Index
+// keys come from the index itself rather than from a disk walk, so clearing
+// adds no filesystem operations. Stores without an index only reset the cache.
+func (d *Diskv) invalidateAllWithLock() {
+	if d.Index != nil && d.IndexLess != nil {
+		for _, key := range d.indexKeysWithLock() {
+			d.invalidateWithLock(key)
+		}
+	}
+	d.cache = make(map[string][]byte)
+	d.cacheSize = 0
+}
+
+// indexKeysWithLock returns every key currently held by the index, paging the
+// query so a large index doesn't require one huge allocation.
+func (d *Diskv) indexKeysWithLock() []string {
+	const pageSize = 1024
+	var keys []string
+	from := ""
+	for {
+		page := d.Index.Keys(from, pageSize)
+		if len(page) == 0 {
+			break
+		}
+		keys = append(keys, page...)
+		next := page[len(page)-1]
+		if next == from {
+			break
+		}
+		from = next
+	}
+	return keys
 }
 
 func (d *Diskv) uncacheWithLock(key string, sz uint64) {

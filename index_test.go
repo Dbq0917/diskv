@@ -2,6 +2,8 @@ package diskv
 
 import (
 	"bytes"
+	"fmt"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -140,6 +142,111 @@ func TestIndexKeysEmptyFrom(t *testing.T) {
 	have := d.Index.Keys("", 99)
 	if !reflect.DeepEqual(want, have) {
 		t.Errorf("want %v, have %v", want, have)
+	}
+}
+
+func TestEraseAllIndexConsistency(t *testing.T) {
+	keys := []string{"a", "b", "c"}
+	newIndexedStore := func(basePath string) *Diskv {
+		d := New(Options{
+			BasePath:     basePath,
+			CacheSizeMax: 1024,
+			Index:        &BTreeIndex{},
+			IndexLess:    strLess,
+		})
+		for _, key := range keys {
+			if err := d.Write(key, []byte(key)); err != nil {
+				t.Fatalf("write %q: %s", key, err)
+			}
+			if _, err := d.Read(key); err != nil {
+				t.Fatalf("read %q: %s", key, err)
+			}
+		}
+		return d
+	}
+
+	assertEmpty := func(label string, d *Diskv) {
+		t.Helper()
+
+		d.mu.RLock()
+		cacheLen, cacheSize := len(d.cache), d.cacheSize
+		d.mu.RUnlock()
+		if cacheLen != 0 || cacheSize != 0 {
+			t.Fatalf("%s: cache has %d keys (%d bytes), want empty", label, cacheLen, cacheSize)
+		}
+
+		if got := d.Index.Keys("", len(keys)+1); len(got) != 0 {
+			t.Fatalf("%s: index has %d keys %v, want empty", label, len(got), got)
+		}
+
+		for key := range d.Keys(nil) {
+			t.Fatalf("%s: disk still has key %q", label, key)
+		}
+	}
+
+	cleared := newIndexedStore("index-erase-all-clear-test")
+	defer cleared.EraseAll()
+	if err := cleared.EraseAll(); err != nil {
+		t.Fatalf("erase all: %s", err)
+	}
+	assertEmpty("EraseAll", cleared)
+
+	erased := newIndexedStore("index-erase-all-delete-test")
+	defer erased.EraseAll()
+	for _, key := range keys {
+		if err := erased.Erase(key); err != nil {
+			t.Fatalf("erase %q: %s", key, err)
+		}
+	}
+	assertEmpty("Erase each key", erased)
+}
+
+func TestEraseAllIndexPages(t *testing.T) {
+	d := New(Options{
+		BasePath:  "index-erase-all-pages-test",
+		Index:     &BTreeIndex{},
+		IndexLess: strLess,
+	})
+	defer d.EraseAll()
+
+	const n = 2500
+	for i := 0; i < n; i++ {
+		d.Index.Insert(fmt.Sprintf("key-%04d", i))
+	}
+	if got := len(d.Index.Keys("", n+1)); got != n {
+		t.Fatalf("index has %d keys before EraseAll, want %d", got, n)
+	}
+
+	if err := d.EraseAll(); err != nil {
+		t.Fatalf("erase all: %s", err)
+	}
+	if got := len(d.Index.Keys("", n+1)); got != 0 {
+		t.Fatalf("index has %d keys after EraseAll, want 0", got)
+	}
+}
+
+func TestReadMissInvalidatesIndex(t *testing.T) {
+	d := New(Options{
+		BasePath:     "index-read-miss-test",
+		CacheSizeMax: 1024,
+		Index:        &BTreeIndex{},
+		IndexLess:    strLess,
+	})
+	defer d.EraseAll()
+
+	key := "gone"
+	if err := d.Write(key, []byte("value")); err != nil {
+		t.Fatalf("write: %s", err)
+	}
+	if err := os.Remove(d.completeFilename(d.transform(key))); err != nil {
+		t.Fatalf("remove backing file: %s", err)
+	}
+
+	if _, err := d.Read(key); !os.IsNotExist(err) {
+		t.Fatalf("read after external delete: got %v, want not-exist", err)
+	}
+	if d.isIndexed(key) {
+		t.Fatalf("read miss left %q in the index", key)
 	}
 }
 
